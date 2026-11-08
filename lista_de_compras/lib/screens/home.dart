@@ -126,7 +126,6 @@ class _HomeScreenState extends State<HomeScreen> {
         'nome': nome,
         'comprado': false,
         'usuario_id': _usuario.id,
-        'categoria': nomeDaAba, // IMPORTANTE: Certifique-se de ter essa coluna text no Supabase
       });
 
       if (mounted) _controller.clear();
