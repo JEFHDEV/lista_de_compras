@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'package:app_links/app_links.dart';
+import 'package:flutter/foundation.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:uuid/uuid.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -27,12 +30,48 @@ class _HomeScreenState extends State<HomeScreen> {
   int _geracaoCargaProdutos = 0;
   bool _carregandoListas = true;
   bool _carregandoProdutos = false;
+  late final AppLinks _appLinks;
 
   @override
   void initState() {
     super.initState();
     _usuario = widget.usuario ?? _supabase.auth.currentUser;
+    _iniciarEscutaDeLinks();
     unawaited(_carregarListas());
+  }
+
+  // 1. Função unificada que decide de onde ler a URL
+  Future<void> _iniciarEscutaDeLinks() async {
+    if (kIsWeb) {
+      // Plataforma WEB: Lê a URL atual do navegador via Uri.base
+      _processarUri(Uri.base);
+    } else {
+      // Plataforma MOBILE: Escuta os Deep Links do sistema operacional
+      _appLinks = AppLinks();
+
+      // Caso A: App já aberto em segundo plano
+      _appLinks.uriLinkStream.listen((uri) {
+        _processarUri(uri);
+      });
+
+      // Caso B: App aberto do zero através do link (Cold Start)
+      final initialUri = await _appLinks.getInitialLink();
+      if (initialUri != null) {
+        _processarUri(initialUri);
+      }
+    }
+  }
+  // 2. Método ÚNICO de processamento (recebe o objeto Uri independente da plataforma)
+  void _processarUri(Uri uri) {
+    if (uri.queryParameters.containsKey('lista_id')) {
+      final listaIdStr = uri.queryParameters['lista_id'];
+      if (listaIdStr != null) {
+        final int listaId = int.parse(listaIdStr);
+        
+        // Executa a vincularão com o Supabase
+        vincularListaAoUsuarioLogado(listaId);
+      }
+    }
   }
 
   @override
@@ -40,6 +79,59 @@ class _HomeScreenState extends State<HomeScreen> {
     _controller.dispose();
     _dialogController.dispose();
     super.dispose();
+  }
+
+  Future<void> vincularListaAoUsuarioLogado(int listaId) async {
+    // 1. Se não houver usuário logado, redirecione para a tela de Login
+    if (_usuario == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Faça login para aceitar o convite da lista.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    try {
+      // 2. Verifica se o usuário já está autorizado nessa lista para não duplicar
+      final jaAutorizado = await _supabase
+          .from('usuarios_autorizados')
+          .select('id')
+          .eq('lista_id', listaId)
+          .eq('usuarios_id', _usuario.id)
+          .maybeSingle();
+
+      if (jaAutorizado != null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Você já faz parte desta lista!')),
+          );
+        }
+        return;
+      }
+
+      // 3. Insere a nova relação na tabela usuarios_autorizados
+      await _supabase.from('usuarios_autorizados').insert({
+        'lista_id': listaId,
+        'usuarios_id': _usuario.id,
+        'role': 'editor', // ou 'guess' conforme a sua regra
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Lista adicionada à sua conta com sucesso!'),
+          ),
+        );
+
+        // Atualiza o estado da tela para recarregar as listas
+        setState(() {});
+      }
+    } catch (error) {
+      print('Erro ao aceitar convite: $error');
+    }
   }
 
   Future<void> _carregarListas() async {
@@ -388,13 +480,11 @@ class _HomeScreenState extends State<HomeScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(
-              'Preencha o email com quem quer compartilhar a lista ${lista.nome}', 
+              'Preencha o email com quem quer compartilhar a lista ${lista.nome}',
             ),
             TextField(
               controller: _dialogController,
-              decoration: const InputDecoration(
-                hintText: 'Email do usuário',
-              ),
+              decoration: const InputDecoration(hintText: 'Email do usuário'),
               autofocus: true,
             ),
           ],
@@ -412,33 +502,36 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
     if (compartilhar != true) return;
-    
-    _adicionarUsuarioNaLista(lista);  
+
+    _adicionarUsuarioNaLista(lista);
   }
-    
-    
+
   Future<void> _adicionarUsuarioNaLista(_ListaCompras lista) async {
-  try {
-    final emailDigitado = _dialogController.text.trim();
+    try {
+      final emailDigitado = _dialogController.text.trim();
 
-    // 1. Verifica se o usuário já existe na tabela 'usuarios' pelo email
-    final existingUser = await _supabase
-        .from('usuarios')
-        .select('id')
-        .eq('email', emailDigitado)
-        .maybeSingle();
+      // 1. Verifica se o usuário já existe na tabela 'usuarios' pelo email
+      final existingUser = await _supabase
+          .from('usuarios')
+          .select('id')
+          .eq('email', emailDigitado)
+          .maybeSingle();
 
-    String usuarioId;
-    var uuid = const Uuid();
-    String novoId = uuid.v4();
+      String usuarioId;
+      var uuid = const Uuid();
+      String novoId = uuid.v4();
 
-    // 2. Se não existir, cria o usuário na tabela 'usuarios' e pega o ID gerado
-    if (existingUser == null) {
-        final novoUsuario = await _supabase.from('usuarios').insert({
-          'id': novoId,
-          'email': emailDigitado,
-          'nome': emailDigitado.split('@').first,
-        }).select('id').single();
+      // 2. Se não existir, cria o usuário na tabela 'usuarios' e pega o ID gerado
+      if (existingUser == null) {
+        final novoUsuario = await _supabase
+            .from('usuarios')
+            .insert({
+              'id': novoId,
+              'email': emailDigitado,
+              'nome': emailDigitado.split('@').first,
+            })
+            .select('id')
+            .single();
 
         usuarioId = novoUsuario['id'];
       } else {
@@ -459,7 +552,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) {
         _mostrarErro('Lista compartilhada com sucesso!');
       }
-
     } catch (error) {
       print('Erro detalhado ao compartilhar: $error');
       if (mounted) {
@@ -472,6 +564,20 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(mensagem)));
+  }
+
+  void _compartilharLink(int listaId, String nomeLista) {
+    // Utilize a sua URL de produção da Vercel ou o esquema de Deep Link do app
+    final String linkConvite =
+        'http://listadecompras-topaz.vercel.app/join?lista_id=$listaId';
+
+    SharePlus.instance.share(
+      ShareParams(
+        text:
+            'Venha colaborar na minha lista de compras "$nomeLista"! Clique no link para aceitar o convite: $linkConvite',
+        subject: 'Convite para Lista de Compras',
+      ),
+    );
   }
 
   @override
@@ -639,48 +745,95 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               Expanded(
-                child: Row(mainAxisAlignment: MainAxisAlignment.center,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     lista.donoId == _usuario?.id
-                    ? const SizedBox.shrink() // Retorna um widget invisível/vazio se a lista for do próprio usuário
-                    : FutureBuilder(
-                        future: _supabase.from('usuarios').select('nome').eq('id', lista.donoId).single(),
-                        builder: (context, snapshot) {
-                          // Exibe um texto temporário enquanto a consulta está em andamento
-                          if (snapshot.connectionState == ConnectionState.waiting) {
-                            return const Text('Compartilhada de (carregando...)');
-                          }
-                          
-                          // Trata o caso em que o ID não foi encontrado ou ocorreu um erro
-                          if (snapshot.hasError || !snapshot.hasData) {
-                            return const Text('Compartilhada (dono desconhecido)');
-                          }
+                        ? const SizedBox.shrink() // Retorna um widget invisível/vazio se a lista for do próprio usuário
+                        : FutureBuilder(
+                            future: _supabase
+                                .from('usuarios')
+                                .select('nome')
+                                .eq('id', lista.donoId)
+                                .single(),
+                            builder: (context, snapshot) {
+                              // Exibe um texto temporário enquanto a consulta está em andamento
+                              if (snapshot.connectionState ==
+                                  ConnectionState.waiting) {
+                                return const SizedBox.shrink(); // Retorna um widget invisível/vazio enquanto carrega
+                              }
 
-                          // O Supabase retorna um Map {'nome': 'Valor'}, então extraímos a chave 'nome'
-                          final nomeDoDono = snapshot.data!['nome'].toString();
+                              // Trata o caso em que o ID não foi encontrado ou ocorreu um erro
+                              if (snapshot.hasError || !snapshot.hasData) {
+                                return const Text(
+                                  'Compartilhada',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 10,
+                                    color: Colors.grey,
+                                  ),
+                                );
+                              }
 
-                          return Text('Compartilhada de $nomeDoDono');
-                        },
-                      )
+                              // O Supabase retorna um Map {'nome': 'Valor'}, então extraímos a chave 'nome'
+                              final nomeDoDono = snapshot.data!['nome']
+                                  .toString();
+
+                              return Text(
+                                'Lista $nomeDoDono',
+                                style: Theme.of(context).textTheme.bodyMedium
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.w600,
+                                      fontSize: 10,
+                                      color: Colors.grey.shade700,
+                                    ),
+                              );
+                            },
+                          ),
                   ],
                 ),
               ),
-              Text(
-                'Compartilhar',
-                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  fontSize: 10,
-                  color: Colors.grey.shade700,
-                ),
-              ),
-              IconButton(
+              PopupMenuButton<String>(
+                onSelected: (value) {
+                  switch (value) {
+                    case 'share_by_email':
+                      _compartilharLista(lista);
+                      break;
+                    case 'share_by_link':
+                      _compartilharLink(lista.id, lista.nome);
+                      break;
+                  }
+                },
                 icon: Icon(
                   Icons.share,
                   color: Theme.of(context).colorScheme.primary,
                 ),
-                onPressed: () {
-                  _compartilharLista(lista);
-                },
+                itemBuilder: (context) => [
+                  PopupMenuItem(
+                    value: 'share_by_email',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.share,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        Text('Adicionar email para compartilhar'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'share_by_link',
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.link,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        Text('Compartilhar por link'),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
