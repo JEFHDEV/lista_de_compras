@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -17,23 +19,20 @@ class _HomeScreenState extends State<HomeScreen> {
   final _supabase = Supabase.instance.client;
   final _controller = TextEditingController();
   final _dialogController = TextEditingController();
-  late final User? _usuario;
-  late final Stream<List<Map<String, dynamic>>> _produtosStream;
 
-  // Lista dinâmica de abas
-  final List<String> _listasTab = ['Geral'];
+  late final User? _usuario;
+  List<_ListaCompras> _listas = [];
+  List<Map<String, dynamic>> _produtos = [];
+  String? _erroProdutos;
+  int _geracaoCargaProdutos = 0;
+  bool _carregandoListas = true;
+  bool _carregandoProdutos = false;
 
   @override
   void initState() {
     super.initState();
     _usuario = widget.usuario ?? _supabase.auth.currentUser;
-    _produtosStream = _usuario == null
-        ? Stream.value(<Map<String, dynamic>>[])
-        : _supabase
-              .from('produtos')
-              .stream(primaryKey: ['id'])
-              .eq('usuario_id', _usuario.id)
-              .order('created_at');
+    unawaited(_carregarListas());
   }
 
   @override
@@ -43,10 +42,108 @@ class _HomeScreenState extends State<HomeScreen> {
     super.dispose();
   }
 
-  // 1. CRIAR NOVA ABA
-  void _criarNovaAba() {
+  Future<void> _carregarListas() async {
+    if (_usuario == null) {
+      if (mounted) {
+        setState(() {
+          _listas = [];
+          _carregandoListas = false;
+        });
+        await _carregarProdutos([]);
+      }
+      return;
+    }
+
+    try {
+      final listasProprias = await _supabase
+          .from('lista')
+          .select('id')
+          .eq('dono', _usuario.id);
+      final listasCompartilhadas = await _supabase
+          .from('usuarios_autorizados')
+          .select('lista_id')
+          .eq('usuarios_id', _usuario.id);
+
+      final ids = <int>{
+        for (final item in listasProprias) (item['id'] as num).toInt(),
+        for (final item in listasCompartilhadas)
+          (item['lista_id'] as num).toInt(),
+      };
+
+      final List<_ListaCompras> listas;
+      if (ids.isEmpty) {
+        listas = [];
+      } else {
+        final response = await _supabase
+            .from('lista')
+            .select('id, nome, dono')
+            .inFilter('id', ids.toList())
+            .order('created_at');
+        listas = response
+            .map(
+              (item) => _ListaCompras(
+                id: (item['id'] as num).toInt(),
+                nome: item['nome'] as String,
+                donoId: item['dono'] as String,
+              ),
+            )
+            .toList();
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _listas = listas;
+        _carregandoListas = false;
+      });
+      await _carregarProdutos(listas);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _carregandoListas = false);
+      _mostrarErro('Não foi possível carregar as listas: $error');
+    }
+  }
+
+  Future<void> _carregarProdutos(List<_ListaCompras> listas) async {
+    final geracao = ++_geracaoCargaProdutos;
+    if (mounted) {
+      setState(() {
+        _carregandoProdutos = true;
+        _erroProdutos = null;
+      });
+    }
+
+    try {
+      final ids = listas.map((lista) => lista.id).toList();
+      final produtos = _usuario == null || ids.isEmpty
+          ? <Map<String, dynamic>>[]
+          : await _supabase
+                .from('produtos')
+                .select()
+                .inFilter('lista_id', ids)
+                .order('created_at');
+
+      if (!mounted || geracao != _geracaoCargaProdutos) return;
+      setState(() {
+        _produtos = produtos;
+        _carregandoProdutos = false;
+      });
+    } catch (error) {
+      if (!mounted || geracao != _geracaoCargaProdutos) return;
+      setState(() {
+        _erroProdutos = 'Não foi possível carregar os produtos: $error';
+        _carregandoProdutos = false;
+      });
+    }
+  }
+
+  Future<void> _criarNovaAba() async {
+    if (_usuario == null) {
+      _mostrarErro('Entre na sua conta para criar uma lista.');
+      return;
+    }
+
     _dialogController.clear();
-    showDialog(
+    final criada = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Nova Categoria'),
@@ -59,15 +156,29 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(context, false),
             child: const Text('Cancelar'),
           ),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final nome = _dialogController.text.trim();
-              if (nome.isNotEmpty && !_listasTab.contains(nome)) {
-                setState(() => _listasTab.add(nome));
-                Navigator.pop(context);
+              if (nome.isEmpty) {
+                _mostrarErro('Informe um nome para a categoria.');
+                return;
+              }
+              if (_listas.any((lista) => lista.nome == nome)) {
+                _mostrarErro('Essa categoria já existe.');
+                return;
+              }
+
+              try {
+                await _supabase.from('lista').insert({
+                  'nome': nome,
+                  'dono': _usuario.id,
+                });
+                if (context.mounted) Navigator.pop(context, true);
+              } catch (error) {
+                _mostrarErro('Não foi possível criar a categoria: $error');
               }
             },
             child: const Text('Criar'),
@@ -75,12 +186,20 @@ class _HomeScreenState extends State<HomeScreen> {
         ],
       ),
     );
+
+    if (criada == true && mounted) {
+      await _carregarListas();
+    }
   }
 
-  // 2. EDITAR ABA
-  void _editarAba(String nomeAntigo, int index) {
-    _dialogController.text = nomeAntigo;
-    showDialog(
+  Future<void> _editarAba(_ListaCompras lista) async {
+    if (lista.donoId != _usuario?.id) {
+      _mostrarErro('Somente o dono pode renomear esta lista.');
+      return;
+    }
+
+    _dialogController.text = lista.nome;
+    final novoNome = await showDialog<String>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('Editar Categoria'),
@@ -95,84 +214,43 @@ class _HomeScreenState extends State<HomeScreen> {
             child: const Text('Cancelar'),
           ),
           ElevatedButton(
-            onPressed: () {
-              final novoNome = _dialogController.text.trim();
-              if (novoNome.isNotEmpty && !_listasTab.contains(novoNome)) {
-                setState(() => _listasTab[index] = novoNome);
-                Navigator.pop(context);
-                // NOTA: Se quiser atualizar no Supabase os produtos antigos desta aba,
-                // você precisará rodar um update na tabela filtrando por nomeAntigo.
-              }
-            },
+            onPressed: () =>
+                Navigator.pop(context, _dialogController.text.trim()),
             child: const Text('Salvar'),
           ),
         ],
       ),
     );
-  }
 
-  // 3. DELETAR ABA
-  void _deletarAba(int index) {
-    setState(() => _listasTab.removeAt(index));
-  }
-
-  // Função para adicionar produto mapeado para a categoria/aba correta
-  Future<void> _adicionarProduto(String nomeDaAba) async {
-    final nome = _controller.text.trim();
-    if (nome.isEmpty || _usuario == null) return;
-
-    try {
-      await _supabase.from('produtos').insert({
-        'nome': nome,
-        'comprado': false,
-        'usuario_id': _usuario.id,
-      });
-
-      if (mounted) _controller.clear();
-    } catch (error) {
-      _mostrarErro('Não foi possível adicionar o produto: $error');
+    if (novoNome == null || novoNome.isEmpty || !mounted) return;
+    if (_listas.any((item) => item.nome == novoNome && item.id != lista.id)) {
+      _mostrarErro('Essa categoria já existe.');
+      return;
     }
-  }
-  // marcar todos os produtos da aba como comprados
-  Future<void> _marcarTodosComoComprados(String nomeDaAba, usuario ) async {
+
     try {
       await _supabase
-          .from('produtos')
-          .update({
-            'comprado': true,
-            'ultima_compra': DateTime.now().toUtc().toIso8601String(),
-          })
-          .eq('usuario_id', usuario?.id)
-          .eq('categoria', nomeDaAba);
+          .from('lista')
+          .update({'nome': novoNome})
+          .eq('id', lista.id)
+          .eq('dono', _usuario!.id);
+      await _carregarListas();
     } catch (error) {
-      _mostrarErro('Não foi possível marcar todos como comprados: $error');
+      _mostrarErro('Não foi possível renomear a categoria: $error');
     }
   }
 
-  // marcar todos os produtos da aba como comprar
-  Future<void> _marcarTodosComoComprar(String nomeDaAba, usuario ) async {
-    try {
-      await _supabase
-          .from('produtos')
-          .update({
-            'comprado': false,
-            'ultima_compra': null,
-          })
-          .eq('usuario_id', usuario?.id)
-          .eq('categoria', nomeDaAba);
-    } catch (error) {
-      _mostrarErro('Não foi possível marcar todos como comprar: $error');
+  Future<void> _deletarAba(_ListaCompras lista) async {
+    if (lista.donoId != _usuario?.id) {
+      _mostrarErro('Somente o dono pode excluir esta lista.');
+      return;
     }
-  }
 
-  // excluir todos os produtos da aba
-  Future<void> _excluirTodosDaAba(String nomeDaAba, usuario ) async {
-    //criar um popup de confirmação antes de excluir todos os produtos da aba
-    bool confirmado = await showDialog(
+    final confirmado = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Confirmar Exclusão'),
-        content: const Text('Tem certeza que deseja excluir todos os produtos desta categoria?'),
+        title: const Text('Confirmar exclusão'),
+        content: Text('Excluir a lista "${lista.nome}"?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -184,35 +262,109 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-    ) ?? false;
-    
-    if (!confirmado) return;
+    );
+    if (confirmado != true) return;
 
     try {
       await _supabase
-          .from('produtos')
+          .from('lista')
           .delete()
-          .eq('usuario_id', usuario?.id)
-          .eq('categoria', nomeDaAba);
+          .eq('id', lista.id)
+          .eq('dono', _usuario!.id);
+      await _carregarListas();
     } catch (error) {
-      _mostrarErro('Não foi possível excluir todos os produtos da aba: $error');
+      _mostrarErro('Não foi possível excluir a lista: $error');
+    }
+  }
+
+  Future<void> _adicionarProduto(_ListaCompras lista) async {
+    final nome = _controller.text.trim();
+    if (nome.isEmpty || _usuario == null) return;
+
+    try {
+      await _supabase.from('produtos').insert({
+        'nome': nome,
+        'comprado': false,
+        'lista_id': lista.id,
+        'categoria': lista.nome,
+      });
+      if (mounted) _controller.clear();
+      await _carregarProdutos(_listas);
+    } catch (error) {
+      _mostrarErro('Não foi possível adicionar o produto: $error');
+    }
+  }
+
+  Future<void> _marcarTodosComoComprados(_ListaCompras lista) async {
+    try {
+      await _supabase
+          .from('produtos')
+          .update({
+            'comprado': true,
+            'ultima_compra': DateTime.now().toUtc().toIso8601String(),
+          })
+          .eq('lista_id', lista.id);
+      await _carregarProdutos(_listas);
+    } catch (error) {
+      _mostrarErro('Não foi possível marcar todos como comprados: $error');
+    }
+  }
+
+  Future<void> _marcarTodosComoComprar(_ListaCompras lista) async {
+    try {
+      await _supabase
+          .from('produtos')
+          .update({'comprado': false, 'ultima_compra': null})
+          .eq('lista_id', lista.id);
+      await _carregarProdutos(_listas);
+    } catch (error) {
+      _mostrarErro('Não foi possível marcar todos como a comprar: $error');
+    }
+  }
+
+  Future<void> _excluirTodosDaAba(_ListaCompras lista) async {
+    final confirmado = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirmar exclusão'),
+        content: const Text(
+          'Tem certeza que deseja excluir todos os produtos desta categoria?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Excluir'),
+          ),
+        ],
+      ),
+    );
+    if (confirmado != true) return;
+
+    try {
+      await _supabase.from('produtos').delete().eq('lista_id', lista.id);
+      await _carregarProdutos(_listas);
+    } catch (error) {
+      _mostrarErro('Não foi possível excluir os produtos: $error');
     }
   }
 
   Future<void> _alternarStatus(Map<String, dynamic> produto) async {
-    final novoStatus = !produto['comprado'];
-    final DateTime agora = DateTime.now();
-
+    final novoStatus = produto['comprado'] != true;
     try {
       await _supabase
           .from('produtos')
           .update({
             'comprado': novoStatus,
             'ultima_compra': novoStatus
-                ? agora.toUtc().toIso8601String()
+                ? DateTime.now().toUtc().toIso8601String()
                 : null,
           })
           .eq('id', produto['id']);
+      await _carregarProdutos(_listas);
     } catch (error) {
       _mostrarErro('Não foi possível atualizar o produto: $error');
     }
@@ -221,6 +373,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _deletarProduto(dynamic id) async {
     try {
       await _supabase.from('produtos').delete().eq('id', id);
+      await _carregarProdutos(_listas);
     } catch (error) {
       _mostrarErro('Não foi possível excluir o produto: $error');
     }
@@ -234,316 +387,286 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      // Chave dinâmica baseada nas strings evita travamentos e bugs visuais na barra de abas
-      key: ValueKey(_listasTab.join(',')),
-      length: _listasTab.length,
-      child: Scaffold(
-        appBar: AppBar(
-          title: Row(
-            children: [
-              PerfilWidget(usuario: _usuario),
-              const Text('🛒 Lista de Compras Online'),
-            ],
-          ),
-          // Garante que as ações fiquem visíveis no topo direito
-          actions: [
-            IconButton(
-              icon: const Icon(
-                Icons.create_new_folder,
-                color: Color.fromARGB(255, 255, 198, 75), // Força uma cor contrastante (mude para a cor do seu tema se necessário)
-                size: 30,
-              ),
-              tooltip: 'Nova Categoria',
-              onPressed: _criarNovaAba,
-            ),
-            const SizedBox(width: 8), // Um pequeno espaçamento da borda da tela
-          ],
-          bottom: _listasTab.isEmpty
-              ? null
-              : TabBar(
-                  isScrollable: true,
-                  tabs: _listasTab
-                      .map((String name) => Tab(text: name))
-                      .toList(),
-                ),
-        ),
-        body: _listasTab.isEmpty
-            ? const Center(
-                child: Text('Nenhuma categoria criada. Toque no ícone acima!'),
-              )
-            : TabBarView(
-                children: List.generate(_listasTab.length, (index) {
-                  final nomeDaAba = _listasTab[index];
+    if (_carregandoListas) {
+      return Scaffold(
+        appBar: _buildAppBar(),
+        body: const Center(child: CircularProgressIndicator()),
+      );
+    }
 
-                  return Column(
-                    children: [
-                      // Cabeçalho de controle interno da aba ativa (Editar / Excluir)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 4,
-                        ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.start,
-                          children: [
-                            PopupMenuButton<String>(
-                              onSelected: (value) {
-                                if (value == 'editar') {
-                                  _editarAba(nomeDaAba, index);
-                                }
-                                if (value == 'deletar') {
-                                  _deletarAba(index);
-                                }
-                                if (value == 'marcar_comprado') {
-                                  // Marcar todos os produtos da aba como comprados
-                                  _marcarTodosComoComprados(nomeDaAba, _usuario);
-                                }
-                                if (value == 'marcar_comprar') {
-                                  // Marcar todos os produtos da aba como comprar
-                                  _marcarTodosComoComprar(nomeDaAba, _usuario);
-                                }
-                                if (value == 'excluir_todos') {
-                                  // Excluir todos os produtos da aba
-                                  _excluirTodosDaAba(nomeDaAba, _usuario);
-                                }
-                              },
-                              itemBuilder: (context) => [
-                                const PopupMenuItem(
-                                  value: 'editar',
-                                  child: Row(
-                                    children: [
-                                      Icon(Icons.edit, size: 20),
-                                      SizedBox(width: 8),
-                                      Text('Renomear Categoria'),
-                                    ],
-                                  ),
-                                ),
-                                const PopupMenuItem(
-                                  value: 'deletar',
-                                  child: Row(
-                                    children: [
-                                      Icon(
-                                        Icons.delete,
-                                        color: Colors.red,
-                                        size: 20,
-                                      ),
-                                      SizedBox(width: 8),
-                                      Text(
-                                        'Excluir Categoria',
-                                        style: TextStyle(color: Colors.red),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                const PopupMenuItem(
-                                  value: 'marcar_comprado',
-                                  child: Row(
-                                    children: [
-                                      Icon(Icons.check, size: 20),
-                                      SizedBox(width: 8),
-                                      Text('Marcar todos como comprados'),
-                                    ],
-                                  ),
-                                ),
-                                const PopupMenuItem(
-                                  value: 'marcar_comprar',
-                                  child: Row(
-                                    children: [
-                                      Icon(Icons.add_shopping_cart, size: 20),
-                                      SizedBox(width: 8),
-                                      Text('Marcar todos como comprar'),
-                                    ],
-                                  ),
-                                ),
-                                const PopupMenuItem(
-                                  value: 'excluir_todos',
-                                  child: Row(
-                                    children: [
-                                      Icon(
-                                        Icons.delete,
-                                        color: Colors.red,
-                                        size: 20,
-                                      ),
-                                      SizedBox(width: 8),
-                                      Text(
-                                        'Excluir todos os produtos',
-                                        style: TextStyle(color: Colors.red),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                              icon: const Icon(Icons.more_horiz),
-                            ),
-                            Text(
-                              'Menu',
-                              style: Theme.of(context).textTheme.bodyMedium
-                                  ?.copyWith(
-                                    fontWeight: FontWeight.w600,
-                                    fontSize: 10,
-                                    color: Colors.grey.shade700,
-                                  ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      // Input para adicionar novos itens
-                      Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: TextField(
-                                controller: _controller,
-                                decoration: const InputDecoration(
-                                  hintText: 'Adicionar novo produto...',
-                                  border: OutlineInputBorder(),
-                                ),
-                                onSubmitted: (_) =>
-                                    _adicionarProduto(nomeDaAba),
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            IconButton.filled(
-                              onPressed: () => _adicionarProduto(nomeDaAba),
-                              icon: const Icon(Icons.add),
-                            ),
-                          ],
-                        ),
-                      ),
-                      // Lista contendo os produtos filtrados da aba atual
-                      Expanded(
-                        child: _buildLista(
-                          abaAtual: nomeDaAba,
-                          somenteComprados: false,
-                        ),
-                      ),
-                    ],
-                  );
-                }),
+    if (_listas.isEmpty) {
+      return Scaffold(
+        appBar: _buildAppBar(),
+        body: const Center(
+          child: Text('Nenhuma categoria criada. Toque no ícone acima!'),
+        ),
+      );
+    }
+
+    return DefaultTabController(
+      key: ValueKey(_listas.map((lista) => lista.id).join(',')),
+      length: _listas.length,
+      child: Scaffold(
+        appBar: _buildAppBar(
+          bottom: TabBar(
+            isScrollable: true,
+            tabs: _listas.map((lista) => Tab(text: lista.nome)).toList(),
+          ),
+        ),
+        body: _carregandoProdutos
+            ? const Center(child: CircularProgressIndicator())
+            : _erroProdutos != null
+            ? Center(child: Text(_erroProdutos!))
+            : TabBarView(
+                children: _listas.map((lista) {
+                  final produtosDaLista = _produtos
+                      .where((produto) => produto['lista_id'] == lista.id)
+                      .toList();
+                  return _buildConteudoLista(lista, produtosDaLista);
+                }).toList(),
               ),
       ),
     );
   }
 
-  // Lista com filtro dinâmico por categoria vinda do Supabase
-  Widget _buildLista({
-    required String abaAtual,
-    required bool somenteComprados,
-  }) {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: _produtosStream,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        if (snapshot.hasError) {
-          return Center(
-            child: Text('Erro ao carregar produtos: ${snapshot.error}'),
-          );
-        }
+  PreferredSizeWidget _buildAppBar({PreferredSizeWidget? bottom}) {
+    return AppBar(
+      title: Row(
+        children: [
+          LogoutButtonWidget(user: _usuario),
+          const Text('🛒 Lista de Compras Online'),
+        ],
+      ),
+      actions: [
+        IconButton(
+          icon: Icon(
+            Icons.create_new_folder,
+            color: Theme.of(context).colorScheme.primary,
+            size: 30,
+          ),
+          tooltip: 'Nova Categoria',
+          onPressed: _criarNovaAba,
+        ),
+        const SizedBox(width: 8),
+      ],
+      bottom: bottom,
+    );
+  }
 
-        // Filtra os produtos salvos pela aba atual E pelo status de comprado
-        final produtos = (snapshot.data ?? []).where((produto) {
-          final pertenceABA =
-              produto['categoria'] == abaAtual ||
-              (abaAtual == 'Geral' && produto['categoria'] == null);
-          final atendeStatus = !somenteComprados || produto['comprado'] == true;
-          return pertenceABA && atendeStatus;
-        }).toList();
-        if (produtos.isEmpty) {
-          return Center(
-            child: Text(
-              somenteComprados
-                  ? 'Nenhuma compra registrada.'
-                  : 'Nenhum produto nesta categoria.',
-            ),
-          );
-        }
-        return ListView.builder(
-          itemCount: produtos.length,
-          itemBuilder: (context, index) {
-            final produto = produtos[index];
-            final comprado = produto['comprado'] == true;
-            final ultimaCompra = produto['ultima_compra'];
-            return ListTile(
-              leading: IconButton(
+  Widget _buildConteudoLista(
+    _ListaCompras lista,
+    List<Map<String, dynamic>> produtos,
+  ) {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+          child: Row(
+            children: [
+              PopupMenuButton<String>(
+                onSelected: (value) {
+                  switch (value) {
+                    case 'editar':
+                      _editarAba(lista);
+                    case 'deletar':
+                      _deletarAba(lista);
+                    case 'marcar_comprado':
+                      _marcarTodosComoComprados(lista);
+                    case 'marcar_comprar':
+                      _marcarTodosComoComprar(lista);
+                    case 'excluir_todos':
+                      _excluirTodosDaAba(lista);
+                  }
+                },
+                itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: 'editar',
+                    child: Row(
+                      children: [
+                        Icon(Icons.edit, size: 20),
+                        SizedBox(width: 8),
+                        Text('Renomear Categoria'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'deletar',
+                    child: Row(
+                      children: [
+                        Icon(Icons.delete, color: Colors.red, size: 20),
+                        SizedBox(width: 8),
+                        Text(
+                          'Excluir Categoria',
+                          style: TextStyle(color: Colors.red),
+                        ),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'marcar_comprado',
+                    child: Row(
+                      children: [
+                        Icon(Icons.check, size: 20),
+                        SizedBox(width: 8),
+                        Text('Marcar todos como comprados'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'marcar_comprar',
+                    child: Row(
+                      children: [
+                        Icon(Icons.add_shopping_cart, size: 20),
+                        SizedBox(width: 8),
+                        Text('Marcar todos como comprar'),
+                      ],
+                    ),
+                  ),
+                  PopupMenuItem(
+                    value: 'excluir_todos',
+                    child: Row(
+                      children: [
+                        Icon(Icons.delete, color: Colors.red, size: 20),
+                        SizedBox(width: 8),
+                        Text(
+                          'Excluir todos os produtos',
+                          style: TextStyle(color: Colors.red),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
                 icon: Icon(
-                  comprado ? Icons.check_box : Icons.check_box_outline_blank,
-                  color: comprado ? Colors.green : Colors.grey,
+                  Icons.more_horiz,
+                  color: Theme.of(context).colorScheme.primary,
                 ),
-                onPressed: () => _alternarStatus(produto),
               ),
-              title: Row(
-                children: [
-                  Flexible(
-                    child: Text(
-                      produto['nome']?.toString() ?? 'Produto',
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        decoration: comprado
-                            ? TextDecoration.lineThrough
-                            : TextDecoration.none,
-                        color: comprado ? Colors.grey : Colors.black87,
-                        fontWeight: comprado
-                            ? FontWeight.normal
-                            : FontWeight.w500,
+              Text(
+                'Menu',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 10,
+                  color: Colors.grey.shade700,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                'Compartilhar',
+                style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 10,
+                  color: Colors.grey.shade700,
+                ),
+              ),
+              IconButton(
+                icon: Icon(
+                  Icons.share,
+                  color: Theme.of(context).colorScheme.primary,
+                ),
+                onPressed: () {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Funcionalidade de compartilhamento ainda não implementada.',
                       ),
                     ),
-                  ),
-                  if (ultimaCompra != null)
-                    Text(
-                      ' ${DateFormat('dd/MM/yy HH:mm').format(DateTime.parse(ultimaCompra.toString()).toLocal())}',
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: Colors.grey.shade600,
-                      ),
-                    ),
-                ],
+                  );
+                },
               ),
-              trailing: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Chip(
-                    label: Text(
-                      comprado ? 'Comprado' : 'A comprar',
-                      style: TextStyle(
-                        color: comprado
-                            ? Colors.green.shade800
-                            : Colors.orange.shade800,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 12,
-                      ),
-                    ),
-                    backgroundColor: comprado
-                        ? Colors.green.shade50
-                        : Colors.orange.shade50,
-                    side: BorderSide.none,
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: _controller,
+                  decoration: const InputDecoration(
+                    hintText: 'Adicionar novo produto...',
+                    border: OutlineInputBorder(),
                   ),
-                  const SizedBox(width: 4),
-                  IconButton(
-                    icon: const Icon(
-                      Icons.delete_outline,
-                      color: Colors.redAccent,
-                    ),
-                    onPressed: () => _deletarProduto(produto['id']),
-                  ),
-                ],
+                  onSubmitted: (_) => _adicionarProduto(lista),
+                ),
               ),
-              onTap: () => _alternarStatus(produto),
-            );
-          },
-        );
-      },
+              const SizedBox(width: 8),
+              IconButton.filled(
+                onPressed: () => _adicionarProduto(lista),
+                icon: const Icon(Icons.add),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: produtos.isEmpty
+              ? const Center(child: Text('Nenhum produto nesta categoria.'))
+              : ListView.builder(
+                  itemCount: produtos.length,
+                  itemBuilder: (context, index) {
+                    final produto = produtos[index];
+                    final comprado = produto['comprado'] == true;
+                    final ultimaCompra = produto['ultima_compra'] == null
+                        ? null
+                        : DateTime.parse(produto['ultima_compra'].toString())
+                              .toLocal();
+
+                    return ListTile(
+                      leading: IconButton(
+                        icon: Icon(
+                          comprado
+                              ? Icons.check_box
+                              : Icons.check_box_outline_blank,
+                          color: comprado ? Colors.green : Colors.grey,
+                        ),
+                        onPressed: () => _alternarStatus(produto),
+                      ),
+                      title: Text(
+                        produto['nome']?.toString() ?? 'Produto',
+                        style: TextStyle(
+                          decoration: comprado
+                              ? TextDecoration.lineThrough
+                              : TextDecoration.none,
+                          color: comprado ? Colors.grey : Colors.black,
+                        ),
+                      ),
+                      subtitle: ultimaCompra == null
+                          ? null
+                          : Text(
+                              'Última compra: ${DateFormat('dd/MM/yyyy').format(ultimaCompra)}',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete, color: Colors.red),
+                        onPressed: () => _deletarProduto(produto['id']),
+                      ),
+                      onTap: () => _alternarStatus(produto),
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 }
 
-// Renomeado e ajustado o NewWidget para seguir as boas práticas de nomenclatura (PascalCase)
-class PerfilWidget extends StatelessWidget {
-  const PerfilWidget({super.key, required this.usuario});
-  final User? usuario;
+class _ListaCompras {
+  const _ListaCompras({
+    required this.id,
+    required this.nome,
+    required this.donoId,
+  });
+
+  final int id;
+  final String nome;
+  final String donoId;
+}
+
+class LogoutButtonWidget extends StatelessWidget {
+  const LogoutButtonWidget({super.key, required this.user});
+
+  final User? user;
+
   @override
   Widget build(BuildContext context) {
     return Row(
@@ -562,10 +685,9 @@ class PerfilWidget extends StatelessWidget {
             height: 30,
             fit: BoxFit.contain,
             errorBuilder: (context, error, stackTrace) =>
-                const Icon(Icons.arrow_back, size: 30, color: Colors.grey),
+                const Icon(Icons.logout, size: 30, color: Colors.grey),
           ),
         ),
-        const SizedBox(width: 8),
       ],
     );
   }
