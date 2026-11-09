@@ -130,7 +130,9 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {});
       }
     } catch (error) {
-      print('Erro ao aceitar convite: $error');
+      if (kDebugMode) {
+        print('Erro ao aceitar convite: $error');
+      }
     }
   }
 
@@ -553,7 +555,9 @@ class _HomeScreenState extends State<HomeScreen> {
         _mostrarErro('Lista compartilhada com sucesso!');
       }
     } catch (error) {
-      print('Erro detalhado ao compartilhar: $error');
+      if (kDebugMode) {
+        print('Erro detalhado ao compartilhar: $error');
+      }
       if (mounted) {
         _mostrarErro('Não foi possível compartilhar a lista: $error');
       }
