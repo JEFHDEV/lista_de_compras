@@ -1,5 +1,5 @@
 import 'dart:async';
-
+import 'package:uuid/uuid.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -379,6 +379,95 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<void> _compartilharLista(_ListaCompras lista) async {
+    final compartilhar = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Compartilhar esta lista'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'Preencha o email com quem quer compartilhar a lista ${lista.nome}', 
+            ),
+            TextField(
+              controller: _dialogController,
+              decoration: const InputDecoration(
+                hintText: 'Email do usuário',
+              ),
+              autofocus: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancelar'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Compartilhar'),
+          ),
+        ],
+      ),
+    );
+    if (compartilhar != true) return;
+    
+    _adicionarUsuarioNaLista(lista);  
+  }
+    
+    
+  Future<void> _adicionarUsuarioNaLista(_ListaCompras lista) async {
+  try {
+    final emailDigitado = _dialogController.text.trim();
+
+    // 1. Verifica se o usuário já existe na tabela 'usuarios' pelo email
+    final existingUser = await _supabase
+        .from('usuarios')
+        .select('id')
+        .eq('email', emailDigitado)
+        .maybeSingle();
+
+    String usuarioId;
+    var uuid = const Uuid();
+    String novoId = uuid.v4();
+
+    // 2. Se não existir, cria o usuário na tabela 'usuarios' e pega o ID gerado
+    if (existingUser == null) {
+        final novoUsuario = await _supabase.from('usuarios').insert({
+          'id': novoId,
+          'email': emailDigitado,
+          'nome': emailDigitado.split('@').first,
+        }).select('id').single();
+
+        usuarioId = novoUsuario['id'];
+      } else {
+        // Se já existir, aproveita o ID encontrado
+        usuarioId = existingUser['id'];
+      }
+
+      // 3. Insere o ID obtido na tabela de relacionamento 'usuarios_autorizados'
+      await _supabase.from('usuarios_autorizados').insert({
+        'lista_id': lista.id,
+        'role': 'guess', // ou 'editor'
+        'usuarios_id': usuarioId,
+      });
+
+      // Limpa o campo e recarrega os produtos/listas
+      _dialogController.clear();
+
+      if (mounted) {
+        _mostrarErro('Lista compartilhada com sucesso!');
+      }
+
+    } catch (error) {
+      print('Erro detalhado ao compartilhar: $error');
+      if (mounted) {
+        _mostrarErro('Não foi possível compartilhar a lista: $error');
+      }
+    }
+  }
+
   void _mostrarErro(String mensagem) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -549,7 +638,33 @@ class _HomeScreenState extends State<HomeScreen> {
                   color: Colors.grey.shade700,
                 ),
               ),
-              const Spacer(),
+              Expanded(
+                child: Row(mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    lista.donoId == _usuario?.id
+                    ? const SizedBox.shrink() // Retorna um widget invisível/vazio se a lista for do próprio usuário
+                    : FutureBuilder(
+                        future: _supabase.from('usuarios').select('nome').eq('id', lista.donoId).single(),
+                        builder: (context, snapshot) {
+                          // Exibe um texto temporário enquanto a consulta está em andamento
+                          if (snapshot.connectionState == ConnectionState.waiting) {
+                            return const Text('Compartilhada de (carregando...)');
+                          }
+                          
+                          // Trata o caso em que o ID não foi encontrado ou ocorreu um erro
+                          if (snapshot.hasError || !snapshot.hasData) {
+                            return const Text('Compartilhada (dono desconhecido)');
+                          }
+
+                          // O Supabase retorna um Map {'nome': 'Valor'}, então extraímos a chave 'nome'
+                          final nomeDoDono = snapshot.data!['nome'].toString();
+
+                          return Text('Compartilhada de $nomeDoDono');
+                        },
+                      )
+                  ],
+                ),
+              ),
               Text(
                 'Compartilhar',
                 style: Theme.of(context).textTheme.bodyMedium?.copyWith(
@@ -564,13 +679,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   color: Theme.of(context).colorScheme.primary,
                 ),
                 onPressed: () {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                        'Funcionalidade de compartilhamento ainda não implementada.',
-                      ),
-                    ),
-                  );
+                  _compartilharLista(lista);
                 },
               ),
             ],

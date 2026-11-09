@@ -54,12 +54,25 @@ class _CadastroScreenState extends State<CadastroScreen> {
       final userId = response.user?.id;
       
       // 2. Se o usuário foi criado com sucesso, salva os dados na tabela pública
-      if (userId != null) {
+      // verifica se o email já existe na tabela 'usuarios'
+      final existingUser = await supabase
+          .from('usuarios')
+          .select()
+          .eq('email', email)
+          .maybeSingle();
+
+      if (userId != null && existingUser == null) {
         await supabase.from('usuarios').insert({
           'id': userId,
           'nome': nome,
           'email': email,
         });
+      } else if (existingUser != null) {
+        // Se o usuário já existe na tabela, atualiza o nome
+        await supabase.from('usuarios').update({
+          'nome': nome,
+          'id': userId, // Atualiza o ID do usuário caso seja diferente
+        }).eq('email', email);
       }
 
       if (!mounted) return;
