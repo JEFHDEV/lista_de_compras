@@ -61,14 +61,24 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     }
   }
+
   // 2. Método ÚNICO de processamento (recebe o objeto Uri independente da plataforma)
   void _processarUri(Uri uri) {
-    if (uri.queryParameters.containsKey('lista_id')) {
-      final listaIdStr = uri.queryParameters['lista_id'];
-      if (listaIdStr != null) {
-        final int listaId = int.parse(listaIdStr);
-        
-        // Executa a vincularão com o Supabase
+    // 1. Tenta capturar o lista_id diretamente
+    String? listaIdStr = uri.queryParameters['lista_id'];
+
+    // 2. Tratamento para o caso do Flutter Web estar em modo Hash (ex: /#/?lista_id=123)
+    if (listaIdStr == null && uri.hasFragment) {
+      try {
+        final fragmentUri = Uri.parse(uri.fragment);
+        listaIdStr = fragmentUri.queryParameters['lista_id'];
+      } catch (_) {}
+    }
+
+    // 3. Se encontrou o ID, executa a vinculação na tabela usuarios_autorizados
+    if (listaIdStr != null) {
+      final int? listaId = int.tryParse(listaIdStr);
+      if (listaId != null) {
         vincularListaAoUsuarioLogado(listaId);
       }
     }
@@ -116,7 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
       await _supabase.from('usuarios_autorizados').insert({
         'lista_id': listaId,
         'usuarios_id': _usuario.id,
-        'role': 'editor', // ou 'guess' conforme a sua regra
+        'role': 'guess', // ou 'guess' conforme a sua regra
       });
 
       if (mounted) {
@@ -127,7 +137,7 @@ class _HomeScreenState extends State<HomeScreen> {
         );
 
         // Atualiza o estado da tela para recarregar as listas
-        setState(() {});
+        await _carregarListas();
       }
     } catch (error) {
       if (kDebugMode) {
@@ -556,7 +566,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     } catch (error) {
       if (kDebugMode) {
-        print('Erro detalhado ao compartilhar: $error');
+        ('Erro detalhado ao compartilhar: $error');
       }
       if (mounted) {
         _mostrarErro('Não foi possível compartilhar a lista: $error');
@@ -573,7 +583,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void _compartilharLink(int listaId, String nomeLista) {
     // Utilize a sua URL de produção da Vercel ou o esquema de Deep Link do app
     final String linkConvite =
-        'http://listadecompras-topaz.vercel.app/join?lista_id=$listaId';
+        'http://listadecompras-topaz.vercel.app/?lista_id=$listaId';
 
     SharePlus.instance.share(
       ShareParams(
